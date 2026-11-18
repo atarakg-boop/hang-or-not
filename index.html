@@ -66,6 +66,30 @@ const TEST_WINDS = [null, '15', '30', '50'];
 const DRY_MM = 0.8;          // כמה מ"מ אידוי צריך סדין כדי להתייבש. לכייל לפי ניסיון.
 const RAIN_PROB = 50;        // מעל זה: "לא כדאי לתלות"
 const IDLE_RETURN_MS = 120000;  // אחרי 2 דקות בלי מגע חוזרים לעכשיו
+
+// ---- הגג: לשנות לפי גג אמיתי ----
+// כיוון החבל במעלות מצפן: 90 = החבל מתוח ממזרח למערב, 0 = מצפון לדרום
+const LINE_BEARING = +(params.get('bearing') || 90);
+// בניינים מסביב: מאיזה אזימוט עד איזה (מצפן), מרחק במטרים, וגובה מעל הגג במטרים
+const BUILDINGS = [
+  { from: 55,  to: 115, dist: 16, height: 7 },   // בניין גבוה ממזרח: מסתיר את השמש בבוקר
+  { from: 245, to: 290, dist: 22, height: 5 },   // בניין ממערב: מקצר את אחר הצהריים
+  { from: 150, to: 200, dist: 30, height: 3 },   // בניין נמוך מדרום
+];
+const SHADE_FACTOR = 0.55;  // בצל, הכביסה מתייבשת בערך בקצב הזה ביחס לשמש (הערכה)
+const LINE_HEIGHT = 1.5;    // גובה מרכז הסדינים מעל הגג
+// גובה הקו האופקי (במעלות) שהבניינים יוצרים בכל אזימוט
+function horizonAt(az) {
+  let h = 0;
+  for (const b of BUILDINGS) {
+    const inside = b.from <= b.to ? az >= b.from && az <= b.to : az >= b.from || az <= b.to;
+    if (inside) h = Math.max(h, Math.atan2(b.height - LINE_HEIGHT, b.dist) * 180 / Math.PI);
+  }
+  return h;
+}
+function inShade(ms) { const p = sunPos(ms); return p.el <= 0 || p.el < horizonAt(p.az); }
+// רוח שנושבת בניצב לחבל מייבשת מהר יותר מרוח שנושבת לאורכו (הערכה: עד 15% הבדל)
+function windAngleFactor(dir) { const a = (dir - LINE_BEARING) * Math.PI / 180; return 0.85 + 0.15 * Math.abs(Math.sin(a)); }
 const MONTHS = ['בינואר','בפברואר','במרץ','באפריל','במאי','ביוני','ביולי','באוגוסט','בספטמבר','באוקטובר','בנובמבר','בדצמבר'];
 const MONTH_NAMES = ['ינואר','פברואר','מרץ','אפריל','מאי','יוני','יולי','אוגוסט','ספטמבר','אוקטובר','נובמבר','דצמבר'];
 const WEEKDAYS = ['א׳','ב׳','ג׳','ד׳','ה׳','ו׳','ש׳'];
@@ -104,7 +128,8 @@ function sunPos(ms) {   // גובה ואזימוט של השמש, במעלות
   return { el: el / rad, az: (az / rad + 360) % 360 };
 }
 // המצלמה מביטה דרומה: דרום = -z, צפון = +z, מזרח = -x, מערב = +x
-function sunVector(el, az) {
+function sunVector(el, azTrue) {
+  const az = azTrue - (LINE_BEARING - 90);   // המצלמה תמיד מביטה בניצב לחבל
   const r = Math.PI / 180, c = Math.cos(el * r);
   return new THREE.Vector3(-Math.sin(az * r) * c, Math.sin(el * r), Math.cos(az * r) * c);
 }
@@ -112,7 +137,7 @@ function sunVector(el, az) {
 // ================= נתונים =================
 const data = { live: null, avg: null, liveSource: '', avgSource: '' };
 
-async function fetchJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(url + ' ' + r.status); return r.json(); }
+async function fetchJSON(url) { const r = await fetch(url); if (!r.ok) { let why = ""; try { why = (await r.json()).reason || ""; } catch (e) {} throw new Error(`${new URL(url, location.href).host} ${r.status} ${why}`.trim()); } return r.json(); }
 
 async function loadLive() {
   const d = await fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LON}` +
@@ -128,9 +153,18 @@ function emptyAvg() { const N = 366 * 24; return { wind: new Float32Array(N), gu
 
 async function computeAverages() {
   const y1 = new Date().getFullYear() - 1, years = Array.from({ length: 10 }, (_, i) => y1 - 9 + i);
-  const parts = await Promise.all(years.map(y => fetchJSON(
-    `https://archive-api.open-meteo.com/v1/archive?latitude=${LAT}&longitude=${LON}&start_date=${y}-01-01&end_date=${y}-12-31` +
-    `&hourly=wind_speed_10m,wind_direction_10m,wind_gusts_10m,cloud_cover,precipitation,et0_fao_evapotranspiration&timezone=${encodeURIComponent(TZ)}`)));
+  // שנה אחרי שנה, עם ניסיון חוזר, כדי לא לחרוג ממגבלת הבקשות של Open-Meteo
+  const parts = [], got = [];
+  for (const y of years) {
+    const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${LAT}&longitude=${LON}&start_date=${y}-01-01&end_date=${y}-12-31` +
+      `&hourly=wind_speed_10m,wind_direction_10m,wind_gusts_10m,cloud_cover,precipitation,et0_fao_evapotranspiration&timezone=${encodeURIComponent(TZ)}`;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { parts.push(await fetchJSON(url)); got.push(y); break; }
+      catch (e) { console.warn('archive', y, e.message); data.avgError = e.message; await new Promise(r => setTimeout(r, 2500 * (attempt + 1))); }
+    }
+    $('status').textContent = `${data.liveSource} · מחשב ממוצע: ${got.length}/${years.length} שנים`;
+  }
+  if (got.length < 3) throw new Error('archive failed: ' + data.avgError);
   const S = emptyAvg();
   for (const p of parts) {
     const H = p.hourly;
@@ -147,7 +181,7 @@ async function computeAverages() {
     });
   }
   const r1 = v => Math.round(v * 10) / 10, r3 = v => Math.round(v * 1000) / 1000;
-  const out = { years: `${years[0]}–${y1}`, lat: LAT, lon: LON, wind: [], gust: [], dir: [], et0: [], cloud: [], rain: [] };
+  const out = { years: got.length === years.length ? `${years[0]}–${y1}` : `${got.length} שנים מתוך ${years[0]}–${y1}`, lat: LAT, lon: LON, wind: [], gust: [], dir: [], et0: [], cloud: [], rain: [] };
   for (let k = 0; k < 366 * 24; k++) {
     const n = S.n[k] || 1;
     out.wind.push(r1(S.wind[k] / n)); out.gust.push(r1(S.gust[k] / n));
@@ -176,7 +210,7 @@ async function loadAverages() {
   try {
     data.avg = await computeAverages(); data.avgSource = 'ממוצע: Open-Meteo Archive';
     try { localStorage.setItem(key, JSON.stringify(data.avg)); } catch (e) {}
-  } catch (e) { console.warn('no averages', e); data.avg = demoAverages(); data.avgSource = 'ממוצע: דוגמה, אין חיבור'; }
+  } catch (e) { console.warn('no averages', e); data.avg = demoAverages(); data.avgSource = 'ממוצע: דוגמה, אין חיבור לארכיון' + (data.avgError ? ` (${data.avgError.slice(0, 60)})` : ''); }
 }
 
 async function refreshLive() {
@@ -210,31 +244,36 @@ function resolve() {
     out.gust = useCur ? c.wind_gusts_10m : H.wind_gusts_10m[i];
     out.dir = useCur ? c.wind_direction_10m : H.wind_direction_10m[i];
     out.cloud = (useCur ? c.cloud_cover : H.cloud_cover[i]) / 100;
+    const i0 = Math.max(0, i), h0 = localToUTC(D.y, D.m, D.d, ui.hour);
     out.dry = (c.precipitation > 0 && useCur) ? { rain: true, hours: 0 } :
-      dryingFrom(k => H.et0_fao_evapotranspiration[Math.max(0, i) + k], k => H.precipitation_probability[Math.max(0, i) + k]);
+      dryingFrom(k => H.et0_fao_evapotranspiration[i0 + k], k => H.precipitation_probability[i0 + k], h0, k => H.wind_direction_10m[i0 + k]);
   } else if (data.avg) {
     const A = data.avg, base = doyIndex(D.m, D.d) * 24 + ui.hour, at = k => (base + k) % (366 * 24);
     out.kind = 'avg';
     out.wind = A.wind[base]; out.gust = A.gust[base]; out.dir = A.dir[base]; out.cloud = A.cloud[base] / 100;
-    out.dry = dryingFrom(k => A.et0[at(k)], k => A.rain[at(k)]);
+    out.dry = dryingFrom(k => A.et0[at(k)], k => A.rain[at(k)], localToUTC(D.y, D.m, D.d, ui.hour), k => A.dir[at(k)]);
   } else { out.kind = 'none'; out.wind = 8; out.gust = 14; out.dir = 270; out.cloud = .2; out.dry = null; }
 
   if (data.avg) {   // הממוצע של אותו יום ושעה, לרוח הרפאים
     const k = doyIndex(D.m, D.d) * 24 + ui.hour;
     out.avgWind = data.avg.wind[k]; out.avgGust = data.avg.gust[k]; out.avgDir = data.avg.dir[k];
-    out.avgDry = dryingFrom(j => data.avg.et0[(k + j) % (366 * 24)], j => data.avg.rain[(k + j) % (366 * 24)]);
+    out.avgDry = dryingFrom(j => data.avg.et0[(k + j) % (366 * 24)], j => data.avg.rain[(k + j) % (366 * 24)], localToUTC(D.y, D.m, D.d, ui.hour), j => data.avg.dir[(k + j) % (366 * 24)]);
   }
+  out.shade = inShade(sunMs);
   if (WIND_OVERRIDE) out.wind = +WIND_OVERRIDE;
   return out;
 }
 
-function dryingFrom(et0At, probAt) {
+// startMs: תחילת השעה הראשונה. dirAt: כיוון הרוח בכל שעה
+function dryingFrom(et0At, probAt, startMs, dirAt) {
   let sum = 0;
   for (let k = 0; k < 60; k++) {
     const p = probAt ? probAt(k) : 0, e = et0At(k);
     if (e == null) return { hours: Infinity };
     if (p >= RAIN_PROB) return { rain: true, hours: k };
-    sum += e;
+    const shade = startMs != null && inShade(startMs + (k + .5) * 36e5) ? SHADE_FACTOR : 1;
+    const wa = dirAt && dirAt(k) != null ? windAngleFactor(dirAt(k)) : 1;
+    sum += e * shade * wa;
     if (sum >= DRY_MM) return { hours: k + 1 };
   }
   return { hours: Infinity };
@@ -258,6 +297,10 @@ function updateHud(s) {
   if (s.kind === 'today' && s.avgWind != null && !WIND_OVERRIDE)
     cmp += ` · ממוצע ל-${s.D.d} ${MONTHS[s.D.m - 1].slice(1)} בשעה הזו: ${Math.round(s.avgWind)} קמ״ש`;
   if (s.kind === 'avg' && data.avg) cmp += ` · ${data.avg.years}`;
+  const DIRS = ['צפון','צפון-מזרח','מזרח','דרום-מזרח','דרום','דרום-מערב','מערב','צפון-מערב'];
+  cmp += ` · נושבת מ${DIRS[Math.round(((s.dir % 360) + 360) % 360 / 45) % 8]}`;
+  const sp = sunPos(s.sunMs);
+  cmp += sp.el <= 0 ? ' · לילה' : s.shade ? ' · הכביסה בצל הבניינים' : ' · הכביסה בשמש';
   if (data.liveSource === 'גיבוי מוקלט') cmp += ' · נתוני דוגמה, לא חיים';
   $('compare').textContent = cmp;
   $('mode').textContent = ui.live ? 'חי' : s.kind === 'today' ? 'היום' : 'ממוצע 10 שנים';
@@ -293,7 +336,7 @@ let envRT = null;
 const sun = new THREE.DirectionalLight(0xffffff, 2);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-Object.assign(sun.shadow.camera, { left: -8, right: 8, top: 8, bottom: -4, near: 1, far: 60 });
+Object.assign(sun.shadow.camera, { left: -10, right: 10, top: 10, bottom: -6, near: 1, far: 140 });
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02; sun.shadow.radius = 5;
 scene.add(sun, sun.target);
 const hemi = new THREE.HemisphereLight(0x8fa6c4, 0x4a4540, 0.2); scene.add(hemi);
@@ -341,6 +384,17 @@ function wall(w, h, d, x, z) {
   m.position.set(x, h / 2, z); m.castShadow = m.receiveShadow = true; scene.add(m);
 }
 wall(16, 1.0, 0.25, 0, -4.8); wall(0.25, 1.0, 14, -7.2, 2); wall(0.25, 1.0, 14, 7.2, 2);
+// הבניינים מסביב, במקום ובגובה שהוגדרו למעלה. הם מטילים צל אמיתי על הכביסה.
+const bldMat = new THREE.MeshStandardMaterial({ color: 0xe2dccf, roughness: .95 });
+for (const b of BUILDINGS) {
+  const span = ((b.to - b.from + 360) % 360) || 360, mid = b.from + span / 2;
+  const width = 2 * b.dist * Math.tan(Math.min(span, 170) / 2 * Math.PI / 180);
+  const v = sunVector(0, mid);   // אותו סיבוב כמו השמש
+  const m = new THREE.Mesh(new THREE.BoxGeometry(width, b.height, 8), bldMat);
+  m.position.set(v.x * (b.dist + 4), b.height / 2, v.z * (b.dist + 4));
+  m.lookAt(0, b.height / 2, 0);
+  m.castShadow = m.receiveShadow = true; scene.add(m);
+}
 
 // ================= חבלים =================
 const SPAN = 4.6, ROPE_Y = 2.3, SAG = 0.12;
@@ -457,11 +511,12 @@ function makeGusts() {
   };
 }
 const gustF = makeGusts(), gustG = makeGusts();
-// הרוח נושבת אל כיוון dir+180. הכיוון האמיתי מטה את הבד לצדדים; רכיב העומק מוגבר כדי שהבד ייפתח.
-function windVec(kmh, dir, factor) {
+// הרוח נושבת אל כיוון dir+180, ביחס לכיוון החבל. רוח לאורך החבל כמעט לא פותחת את הסדינים, כמו במציאות.
+// jitter: הכיוון של רוח אמיתית רועד בכמה עשרות מעלות במשבים, ולכן גם רוח מקבילה מנפנפת לפעמים.
+function windVec(kmh, dirTrue, factor, jitter = 0) {
+  const dir = dirTrue - (LINE_BEARING - 90) + jitter;
   const r = dir * Math.PI / 180, ms = kmh / 3.6 * factor;
-  const zr = -Math.cos(r), xr = Math.sin(r);
-  return { x: xr * ms * .25, z: Math.sign(zr || 1) * Math.max(Math.abs(zr), .55) * ms };
+  return { x: Math.sin(r) * ms, z: -Math.cos(r) * ms };
 }
 
 // ================= צליל =================
@@ -529,7 +584,7 @@ function applyLighting(dt) {
   domeMat.color.setRGB(domeBright * .95, domeBright, domeBright * 1.05);
   domeMat.opacity = Math.min(.9, Math.pow(cloud, 1.4) * 1.05);
 
-  sun.position.copy(cur.sun).multiplyScalar(30); sun.target.position.set(0, 0, 0);
+  sun.position.copy(cur.sun).multiplyScalar(70); sun.target.position.set(0, 0, 0);
   tmp.copy(warm).lerp(white, THREE.MathUtils.smoothstep(el, 0, 28));
   sun.color.copy(tmp); sun.intensity = 2.6 * dayK * (1 - .8 * cloud);
   sunU.col.value.copy(tmp).multiplyScalar(sun.intensity * .5);
@@ -572,7 +627,8 @@ function loop() {
   ghostLineMats.forEach(m => m.opacity = .35 * cur.ghost);
 
   const gf = gustF(t, dt, cur.wind > 0 ? cur.gust / cur.wind : 1.5), gg = gustG(t, dt, 1.5);
-  const wf = windVec(cur.wind, cur.dir, gf), wg = windVec(cur.avgWind, cur.avgDir, gg);
+  const jit = 28 * Math.sin(t * .31) * Math.sin(t * .13 + 2) + 12 * Math.sin(t * 1.1);
+  const wf = windVec(cur.wind, cur.dir, gf, jit), wg = windVec(cur.avgWind, cur.avgDir, gg);
   acc += dt;
   while (acc >= DT) { front.forEach(c => c.step(DT, wf, t));  acc -= DT; }
   [...front, ...ghosts].forEach(c => c.sync());
@@ -587,8 +643,9 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
-await Promise.all([refreshLive(), loadAverages()]);
+await refreshLive();
 loop();
+loadAverages();
 setInterval(refreshLive, 10 * 60 * 1000);
 </script>
 </body>
